@@ -75,6 +75,7 @@ import {
   createStellarSignatureAuthMiddleware,
 } from './middleware/auth';
 import { idempotencyMiddleware } from './middleware/idempotency';
+import { IdempotencyKeyReuseError, runIdempotent } from './idempotency';
 import { requireJsonContentType } from './middleware/contentType';
 import { enforceBodyLimit, DEFAULT_BODY_LIMIT } from './middleware/bodyLimit';
 import { maintainerLimiter } from './middleware/maintainerLimiter';
@@ -1272,17 +1273,39 @@ app.post(
     req.body = parsed.data.body;
     next();
   },
-  idempotencyMiddleware,
   async (req: Request, res: Response) => {
     try {
-      const bounty = await reserveBounty(
-        parseId(req.params.id),
-        req.body.contributor,
-        req.body.expectedVersion
+      const id = parseId(req.params.id);
+      const execute = async () => ({
+        status: 200,
+        body: { data: await reserveBounty(id, req.body.contributor, req.body.expectedVersion) },
+      });
+
+      const rawKey = req.headers['idempotency-key'];
+      const key = (Array.isArray(rawKey) ? rawKey[0] : rawKey)?.trim();
+
+      if (!key) {
+        const { status, body } = await execute();
+        res.status(status).json(body);
+        return;
+      }
+
+      // Scope the key to this route and bounty so it cannot collide with other endpoints.
+      const { result, replayed } = await runIdempotent(
+        `reserve:${id}:${key}`,
+        JSON.stringify([req.body.contributor, req.body.expectedVersion ?? null]),
+        execute
       );
 
-      res.json({ data: bounty });
+      if (replayed) {
+        res.setHeader('Idempotent-Replayed', 'true');
+      }
+      res.status(result.status).json(result.body);
     } catch (error) {
+      if (error instanceof IdempotencyKeyReuseError) {
+        jsonError(res, req, 422, 'Idempotency-Key was already used with a different request');
+        return;
+      }
       sendError(res, req, error);
     }
   }
